@@ -1,6 +1,10 @@
 import os
 import json
 import gc
+import re
+import threading
+import time
+from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import torch
@@ -10,6 +14,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from transformers import (
     AutoTokenizer,
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     BertTokenizer,
     BertForSequenceClassification,
@@ -36,6 +41,7 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 TOP_RETRIEVAL = 20
 TOP_RERANKED = 5
+GENERATION_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DENSE_TOP = 100
 BM25_TOP = 100
 
@@ -189,6 +195,9 @@ rr_tokenizer = None
 rr_model = None
 dense_model = None
 _CORE_LOADED = False
+generation_tokenizer = None
+generation_model = None
+_GENERATION_LOCK = threading.Lock()
 
 def load_core_resources():
     global clf_tokenizer, clf_model, rr_tokenizer, rr_model, dense_model, _CORE_LOADED
@@ -968,6 +977,10 @@ def search_arxiv_paper(title, limit=5):
 
 
 
+_ARXIV_REQUEST_LOCK = threading.Lock()
+_ARXIV_LAST_REQUEST_AT = 0.0
+
+
 def search_arxiv_external(query_text, max_results=5):
     """
     Search arXiv for external research evidence.
@@ -977,7 +990,6 @@ def search_arxiv_external(query_text, max_results=5):
     """
     import requests
     import xml.etree.ElementTree as ET
-    from urllib.parse import quote_plus
 
     query_text = str(query_text).strip()
 
@@ -994,8 +1006,7 @@ def search_arxiv_external(query_text, max_results=5):
     }
 
     terms = []
-    for token in query_text.lower().replace("?", " ").split():
-        token = token.strip(".,:;!?()[]{}\"'")
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", query_text.lower()):
         if len(token) >= 3 and token not in stopwords:
             if token not in terms:
                 terms.append(token)
@@ -1006,25 +1017,22 @@ def search_arxiv_external(query_text, max_results=5):
     # arXiv interprets ungrouped terms as OR. Use an AND query
     # so the external results stay reasonably focused.
     terms = terms[:5]
-    search_query = " AND ".join(
-        f"all:{quote_plus(term)}"
-        for term in terms
-    )
+    search_query = " AND ".join(f"all:{term}" for term in terms)
 
     url = "https://export.arxiv.org/api/query"
 
     try:
-        response = requests.get(
-            url,
-            params={
-                "search_query": search_query,
-                "start": 0,
-                "max_results": max_results,
-                "sortBy": "relevance",
-                "sortOrder": "descending",
-            },
-            timeout=20,
-        )
+        global _ARXIV_LAST_REQUEST_AT
+        with _ARXIV_REQUEST_LOCK:
+            delay = 3.0 - (time.monotonic() - _ARXIV_LAST_REQUEST_AT)
+            if delay > 0:
+                time.sleep(delay)
+            _ARXIV_LAST_REQUEST_AT = time.monotonic()
+            response = requests.get(url, params={
+                "search_query": search_query, "start": 0,
+                "max_results": min(max(int(max_results), 1), 20),
+                "sortBy": "relevance", "sortOrder": "descending",
+            }, timeout=(5, 20), headers={"User-Agent":"AdaptiveRAGCapstone/1.0 (scholarly retrieval)"})
 
         response.raise_for_status()
 
@@ -1083,6 +1091,7 @@ def search_arxiv_external(query_text, max_results=5):
                 "http://arxiv.org/",
                 "https://arxiv.org/",
             )
+            arxiv_id = urlparse(arxiv_url).path.rsplit("/", 1)[-1]
 
             pdf_url = arxiv_url.replace(
                 "/abs/",
@@ -1091,6 +1100,7 @@ def search_arxiv_external(query_text, max_results=5):
 
             matches.append({
                 "source": "arXiv",
+                "source_type": "arxiv",
                 "title": " ".join(title.split()),
                 "authors": ", ".join(
                     author for author in authors if author
@@ -1102,18 +1112,179 @@ def search_arxiv_external(query_text, max_results=5):
                 ),
                 "url": arxiv_url,
                 "pdf_url": pdf_url,
+                "paper_id": arxiv_id,
+                "external_id": arxiv_id,
+                "published": published or None,
                 "abstract": " ".join(
                     abstract.split()
                 ),
+                "text": f"{' '.join(title.split())}\n\n{' '.join(abstract.split())}" if abstract else " ".join(title.split()),
             })
 
         return matches
 
     except Exception as exc:
-        print(
-            f"[RAG BACKEND] arXiv external search failed: {exc}"
-        )
+        print(f"[RAG BACKEND] arXiv external search failed: {exc}")
+        raise
+
+
+def _openalex_abstract(inverted_index):
+    if not isinstance(inverted_index, dict):
+        return ""
+    words = {}
+    for word, positions in inverted_index.items():
+        for pos in positions or []:
+            try:
+                words[int(pos)] = str(word)
+            except (ValueError, TypeError):
+                continue
+    return " ".join(words.get(i, "") for i in range(max(words) + 1)).strip() if words else ""
+
+
+def search_openalex(query_text, max_results=10):
+    import requests
+    query_text = re.sub(r"[?*]+", " ", str(query_text).strip())[:500]
+    if not query_text:
         return []
+    response = requests.get(
+        "https://api.openalex.org/works",
+        params={"search": query_text, "per-page": min(max(int(max_results), 1), 20),
+                "select": "id,doi,title,publication_year,publication_date,authorships,abstract_inverted_index,primary_location,best_oa_location,cited_by_count,relevance_score"},
+        timeout=(5, 15), headers={"User-Agent": "AdaptiveRAGCapstone/1.0 (scholarly retrieval)"},
+    )
+    response.raise_for_status()
+    output = []
+    for work in response.json().get("results", []):
+        title = str(work.get("title") or "").strip()
+        openalex_url = str(work.get("id") or "").strip()
+        if not title or not openalex_url:
+            continue
+        abstract = _openalex_abstract(work.get("abstract_inverted_index"))
+        authors = [str((a.get("author") or {}).get("display_name") or "") for a in work.get("authorships", [])]
+        loc = work.get("primary_location") or {}
+        best = work.get("best_oa_location") or {}
+        doi = str(work.get("doi") or "")
+        url = str(loc.get("landing_page_url") or best.get("landing_page_url") or doi or openalex_url)
+        output.append({"source":"OpenAlex", "source_type":"openalex", "title":title,
+            "authors":", ".join(x for x in authors if x), "text":f"{title}\n\n{abstract}" if abstract else title,
+            "abstract":abstract, "url":url, "openalex_url":openalex_url, "doi":doi,
+            "paper_id":doi or openalex_url.rstrip("/").rsplit("/",1)[-1],
+            "external_id":openalex_url.rstrip("/").rsplit("/",1)[-1],
+            "published":work.get("publication_date") or work.get("publication_year"),
+            "year":work.get("publication_year"), "cited_by_count":work.get("cited_by_count"),
+            "search_score":work.get("relevance_score")})
+    return output
+
+
+def external_research_search(query_text, use_openalex=True, use_arxiv=True, openalex_limit=10, arxiv_limit=10):
+    candidates, errors = [], {}
+    counts = {"openalex": 0, "arxiv": 0}
+    for enabled, label, key, search in (
+        (use_openalex, "OpenAlex", "openalex", lambda: search_openalex(query_text, openalex_limit)),
+        (use_arxiv, "arXiv", "arxiv", lambda: search_arxiv_external(query_text, arxiv_limit)),
+    ):
+        if not enabled:
+            continue
+        try:
+            records = search()
+            for item in records:
+                item.setdefault("source_type", key)
+                if key == "arxiv":
+                    item.setdefault("paper_id", urlparse(str(item.get("url", ""))).path.rsplit("/",1)[-1])
+                item.setdefault("text", f"{item.get('title','')}\n\n{item.get('abstract','')}".strip())
+            candidates.extend(records)
+            counts[key] = len(records)
+        except Exception as exc:
+            errors[label] = f"{type(exc).__name__}: {exc}"
+    return {"candidates":candidates, "errors":errors, "counts":counts}
+
+
+def _title_key(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def deduplicate_external_candidates(candidates):
+    merged, keys_to_idx = [], {}
+    for item in candidates or []:
+        item = dict(item)
+        keys = set()
+        doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", str(item.get("doi") or "").lower()).strip()
+        if doi: keys.add(("doi", doi))
+        aid = str(item.get("paper_id") or item.get("external_id") or "")
+        match = re.search(r"(\d{4}\.\d{4,5})(?:v\d+)?$", aid)
+        if match: keys.add(("arxiv", match.group(1)))
+        title = _title_key(item.get("title"))
+        if title: keys.add(("title", title))
+        found = {keys_to_idx[k] for k in keys if k in keys_to_idx}
+        if not found:
+            idx = len(merged)
+            record = dict(item)
+            record["source_records"] = [{**item, "source_records": None}]
+            record["source_labels"] = [item.get("source", "Unknown")]
+            merged.append(record)
+        else:
+            idx = min(found)
+            record = merged[idx]
+            record["source_records"].append({**item, "source_records": None})
+            if item.get("source") not in record["source_labels"]:
+                record["source_labels"].append(item.get("source", "Unknown"))
+            if len(str(item.get("text") or "")) > len(str(record.get("text") or "")):
+                for field in ("title", "text", "abstract"):
+                    if item.get(field): record[field] = item[field]
+        for key in keys: keys_to_idx[key] = idx
+    for item in merged:
+        if len(item["source_labels"]) > 1:
+            item["source"] = " + ".join(item["source_labels"])
+            item["source_type"] = "external_merged"
+    return merged
+
+
+def _citation_sources(item):
+    records = item.get("source_records") or [item]
+    return [{"source":x.get("source") or item.get("source", "Unknown"),
+             "title":x.get("title") or item.get("title", "Untitled source"),
+             "url":None if (x.get("source_type") == "local" or item.get("source_type") == "local") else (x.get("url") or x.get("openalex_url")),
+             "paper_id":x.get("paper_id"), "chunk_id":x.get("chunk_id") or item.get("chunk_id")} for x in records]
+
+
+def load_generation_model():
+    global generation_tokenizer, generation_model
+    if generation_tokenizer is not None and generation_model is not None:
+        return generation_tokenizer, generation_model
+    with _GENERATION_LOCK:
+        if generation_tokenizer is None or generation_model is None:
+            tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
+            model = AutoModelForCausalLM.from_pretrained(GENERATION_MODEL, dtype=torch.float32, use_safetensors=True).to(DEVICE).eval()
+            generation_tokenizer, generation_model = tokenizer, model
+    return generation_tokenizer, generation_model
+
+
+def generate_grounded_answer(query_text, reranked_results, max_results=5):
+    selected = list(reranked_results or [])[:max(1, min(int(max_results), 5))]
+    citations, blocks = [], []
+    for i, item in enumerate(selected, 1):
+        title = str(item.get("title") or "Untitled source")
+        text = re.sub(r"\s+", " ", str(item.get("text") or item.get("abstract") or "")).strip()[:1400]
+        citations.append({"ref":f"[{i}]", "title":title, "sources":_citation_sources(item)})
+        blocks.append(f"[{i}] TITLE: {title}\nSOURCE: {item.get('source','Unknown')}\nEVIDENCE: {text}")
+    if not blocks:
+        return {"answer":"The retrieved evidence is insufficient to answer this question.", "citations":[], "model":GENERATION_MODEL}
+    system = ("Answer using only the supplied evidence. Do not invent facts, citations, identifiers, or URLs; do not browse. "
+              "Cite each factual claim using the supplied bracket references. If evidence is insufficient or the question is outside scope, say so clearly. "
+              "If sources disagree, explain the disagreement and cite the relevant sources. Do not claim unsupported information.")
+    user = f"QUESTION: {query_text}\n\nFINAL RERANKED EVIDENCE:\n" + "\n\n".join(blocks)
+    tokenizer, model = load_generation_model()
+    messages = [{"role":"system","content":system},{"role":"user","content":user}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) if getattr(tokenizer,"chat_template",None) else f"System: {system}\n\nUser: {user}\n\nAssistant:"
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    encoded = {k:v.to(DEVICE) for k,v in encoded.items()}
+    with torch.inference_mode():
+        output = model.generate(**encoded, max_new_tokens=220, do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)
+    answer = tokenizer.decode(output[0][encoded["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+    valid = {c["ref"] for c in citations}
+    answer = re.sub(r"\[(\d+)\]", lambda m: m.group(0) if m.group(0) in valid else "", answer)
+    return {"answer":answer, "citations":citations, "model":GENERATION_MODEL}
 
 
 def query(
@@ -1121,6 +1292,8 @@ def query(
     dataset="trec",
     top_k=5,
     include_external=False,
+    include_local=True,
+    external_data=None,
 ):
     """
     Main frontend API.
@@ -1164,12 +1337,18 @@ def query(
     # 2. Adaptive hybrid retrieval
     # --------------------------------------------------------
 
-    candidates = hybrid_retrieve(
-        query_text,
-        dataset,
-        alpha,
-        top_k=TOP_RETRIEVAL,
-    )
+    local_candidates = []
+    if include_local:
+        local_candidates = hybrid_retrieve(query_text, dataset, alpha, top_k=TOP_RETRIEVAL)
+        for item in local_candidates:
+            item["source"] = "Local corpus"
+            item["source_type"] = "local"
+    if include_external:
+        external_data = external_data or external_research_search(query_text)
+    else:
+        external_data = external_data or {"candidates": [], "errors": {}, "counts": {}}
+    external_candidates = deduplicate_external_candidates(external_data.get("candidates", []))
+    candidates = local_candidates + external_candidates
 
     # --------------------------------------------------------
     # 3. Cross-encoder reranking
@@ -1205,38 +1384,6 @@ def query(
             item["source"] = source.get("source", "")
             item["source_url"] = source.get("source_url", "")
 
-    if dataset == "aiml" and include_external:
-        source_cache = {}
-
-        for item in results:
-            title = str(
-                item.get("title", "")
-            ).strip()
-
-            if not title:
-                continue
-
-            if title not in source_cache:
-                matches = search_arxiv_paper(
-                    title
-                )
-                source_cache[title] = (
-                    matches[0]
-                    if matches
-                    else None
-                )
-
-            source = source_cache[title]
-
-            if source:
-                item["source"] = source["source"]
-                item["source_url"] = source["url"]
-                item["pdf_url"] = source["pdf_url"]
-            else:
-                item["source"] = ""
-                item["source_url"] = ""
-                item["pdf_url"] = ""
-
     return {
         "query": query_text,
         "dataset": dataset,
@@ -1244,6 +1391,13 @@ def query(
         "alpha": float(alpha),
         "query_type": query_type,
         "retrieved_count": len(candidates),
+        "source_counts": {
+            "local": len(local_candidates),
+            "openalex": int(external_data.get("counts", {}).get("openalex", 0)),
+            "arxiv": int(external_data.get("counts", {}).get("arxiv", 0)),
+            "final_reranked": len(results),
+        },
+        "source_errors": external_data.get("errors", {}),
         "candidates": candidates,
         "results": results,
     }

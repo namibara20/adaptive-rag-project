@@ -199,22 +199,38 @@ except Exception as exc:
     BACKEND_ERROR = exc
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_external_search(query_text, use_openalex, use_arxiv):
+    """Cache normalized scholarly API results across Streamlit reruns."""
+    if rag_backend is None:
+        return {"candidates": [], "errors": {}, "counts": {}}
+    return rag_backend.external_research_search(
+        query_text,
+        use_openalex=use_openalex,
+        use_arxiv=use_arxiv,
+    )
+
+
 # ============================================================
 # HELPERS
 # ============================================================
 
 
-def aiml_query(query_text, top_k=5):
-    return rag_backend.query(query_text, dataset="aiml", top_k=top_k)
-
-
-def run_query(query_text, dataset_key, top_k):
-    if dataset_key == "aiml":
-        return aiml_query(query_text, top_k)
+def run_query(query_text, dataset_key, top_k, use_local, use_openalex, use_arxiv):
+    external_data = {"candidates": [], "errors": {}, "counts": {}}
+    if use_openalex or use_arxiv:
+        external_data = cached_external_search(
+            query_text,
+            use_openalex=use_openalex,
+            use_arxiv=use_arxiv,
+        )
     return rag_backend.query(
         query_text,
         dataset=dataset_key,
         top_k=top_k,
+        include_local=use_local,
+        include_external=use_openalex or use_arxiv,
+        external_data=external_data,
     )
 
 
@@ -227,7 +243,7 @@ def show_result(result):
     with c2:
         st.metric("Adaptive α", f"{float(result.get('alpha', 0)):.2f}")
     with c3:
-        st.metric("Hybrid candidates", int(result.get("retrieved_count", 0)))
+        st.metric("Combined candidates", int(result.get("retrieved_count", 0)))
 
     st.caption(
         "α controls the hybrid balance: α = 0.2 favors BM25, "
@@ -235,52 +251,75 @@ def show_result(result):
     )
     st.caption("Hybrid retrieval: BM25 + BGE-M3 → Cross-Encoder re-ranking")
 
+    counts = result.get("source_counts", {})
+    count_cols = st.columns(4)
+    for col, label, key in zip(
+        count_cols,
+        ("Local", "OpenAlex", "arXiv", "Final reranked"),
+        ("local", "openalex", "arxiv", "final_reranked"),
+    ):
+        with col:
+            st.metric(label, int(counts.get(key, 0)))
+
+    for source, error in result.get("source_errors", {}).items():
+        st.warning(f"{source} search was unavailable: {error}")
+
     results = result.get("results", [])
 
     if not results:
         st.warning("No evidence was retrieved.")
         return
 
-    top = results[0]
+    generation = result.get("generation")
+    if generation:
+        st.markdown("### Generated answer grounded in retrieved evidence")
+        with st.container(border=True):
+            st.info(generation.get("answer") or "The model returned an empty answer.")
+            st.caption(f"Local generation model: {generation.get('model', 'unknown')}")
+            if generation.get("citations"):
+                st.markdown("**Sources / citations**")
+                for citation in generation["citations"]:
+                    st.markdown(f"{citation['ref']} **{citation.get('title', 'Untitled source')}**")
+                    for source in citation.get("sources", []):
+                        label = source.get("source", "Source")
+                        if source.get("chunk_id"):
+                            label += f" · chunk {source['chunk_id']}"
+                        if source.get("url"):
+                            st.markdown(f"[{label}]({source['url']})")
+                        else:
+                            st.caption(label)
+    elif result.get("generation_error"):
+        st.warning(f"Grounded generation failed; retrieved evidence is still available. {result['generation_error']}")
 
-    st.markdown("### Top re-ranked evidence")
-
-    st.markdown(
-        f"""<div class="key-evidence">
-<div class="key-label">Cross-encoder re-ranked result #1</div>
-<div class="key-title">{top.get("title", "Source document")}</div>
-<div class="evidence-meta">
-{top.get("chunk_id", "")} · re-rank score {float(top.get("rerank_score", 0)):.4f}
-</div>
-<div class="key-text">{top.get("text", "")}</div>
-</div>""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("### Hybrid retrieval + re-ranking")
+    st.markdown("### Retrieved evidence")
 
     for i, item in enumerate(results, 1):
-        extra = ""
-        if "authors" in item and item.get("authors"):
-            extra = f" · {item['authors']}"
-
-        st.markdown(
-            f"""<div class="evidence">
-<div class="evidence-title">{i}. {item.get("title", "Source document")}</div>
-<div class="evidence-meta">
-{item.get("chunk_id", "")}{extra} ·
-hybrid score {float(item.get("score", 0)):.4f} ·
-re-rank {float(item.get("rerank_score", 0)):.4f}
-</div>
-<div class="evidence-text">{item.get("text", "")}</div>
-</div>""",
-            unsafe_allow_html=True,
-        )
-
-        if item.get("paper_id"):
-            st.caption(
-                f"AI/ML paper ID: {item['paper_id']}"
-            )
+        with st.container(border=True):
+            st.markdown(f"#### {i}. {item.get('title') or 'Untitled source'}")
+            st.caption(f"Source: {item.get('source', 'Unknown')}")
+            metadata = []
+            if item.get("authors"):
+                metadata.append(f"Authors: {item['authors']}")
+            if item.get("published") or item.get("year"):
+                metadata.append(f"Published: {item.get('published') or item.get('year')}")
+            if item.get("paper_id"):
+                metadata.append(f"Paper ID: {item['paper_id']}")
+            if item.get("doi"):
+                metadata.append(f"DOI: {item['doi']}")
+            if item.get("cited_by_count") is not None:
+                metadata.append(f"Cited by: {item['cited_by_count']}")
+            if item.get("chunk_id"):
+                metadata.append(f"Chunk: {item['chunk_id']}")
+            if metadata:
+                st.caption(" · ".join(metadata))
+            if item.get("source_type") == "local" and item.get("score") is not None:
+                st.caption(f"Hybrid retrieval score: {float(item['score']):.4f}")
+            elif item.get("search_score") is not None:
+                st.caption(f"OpenAlex search relevance: {float(item['search_score']):.4f}")
+            st.caption(f"Cross-encoder reranking score: {float(item.get('rerank_score', 0)):.4f}")
+            st.write(item.get("text") or item.get("abstract") or "No passage or abstract was returned.")
+            if item.get("url"):
+                st.link_button("Open source record", item["url"])
 
 
 # ============================================================
@@ -317,7 +356,7 @@ with st.sidebar:
         • Natural Questions  
         • TREC-COVID  
         • SQuAD  
-        • AI/ML Research — 89 papers
+        • AI/ML Research 
         """
     )
 
@@ -353,7 +392,9 @@ st.markdown(
 <div class="stage">Adaptive α</div><div class="arrow">→</div>
 <div class="stage">Hybrid Retrieval: BM25 + BGE-M3</div><div class="arrow">→</div>
 <div class="stage">Cross-Encoder</div><div class="arrow">→</div>
-<div class="stage">Evidence</div>
+<div class="stage">Top Evidence</div><div class="arrow">→</div>
+<div class="stage">Local Instruct LLM</div><div class="arrow">→</div>
+<div class="stage">Grounded Answer + Citations</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -383,12 +424,22 @@ with tab_search:
     st.markdown(
         f"""<div class="notice">
 <b>{dataset_label}</b> — Ask any free-form question. The system retrieves
-and reranks relevant passages from the local AI/ML paper corpus.
+and reranks evidence from the local corpus and selected external scholarly sources.
 </div>""",
         unsafe_allow_html=True,
     )
 
     examples = {"aiml": "What is LoRA and why is it useful for fine-tuning large language models?"}
+
+    st.markdown("### Search sources")
+    source_cols = st.columns(3)
+    with source_cols[0]:
+        use_local = st.checkbox("Local 89-paper corpus", value=True)
+    with source_cols[1]:
+        use_openalex = st.checkbox("OpenAlex", value=True)
+    with source_cols[2]:
+        use_arxiv = st.checkbox("arXiv", value=True)
+    generate_answer = st.checkbox("Generate grounded answer", value=False)
 
     with st.container(border=True):
         query_text = st.text_area(
@@ -415,15 +466,33 @@ and reranks relevant passages from the local AI/ML paper corpus.
 
         if not query_text:
             st.warning("Please enter a research question.")
+        elif not (use_local or use_openalex or use_arxiv):
+            st.warning("Select at least one research source.")
         elif rag_backend is None:
             st.error(
                 "The trained research backend could not be loaded. "
                 "Check the terminal traceback before the demonstration."
             )
         else:
-            with st.spinner("Running adaptive hybrid retrieval and re-ranking..."):
+            with st.spinner("Searching selected sources and reranking research evidence..."):
                 try:
-                    result = run_query(query_text, dataset_key, top_k)
+                    result = run_query(
+                        query_text,
+                        dataset_key,
+                        top_k,
+                        use_local,
+                        use_openalex,
+                        use_arxiv,
+                    )
+                    if generate_answer:
+                        try:
+                            result["generation"] = rag_backend.generate_grounded_answer(
+                                query_text, result.get("results", []), max_results=5
+                            )
+                        except Exception as generation_exc:
+                            result["generation_error"] = (
+                                f"{type(generation_exc).__name__}: {generation_exc}"
+                            )
                     st.session_state["last_result"] = result
                     st.session_state["last_dataset"] = dataset_label
                 except Exception as exc:
@@ -433,13 +502,9 @@ and reranks relevant passages from the local AI/ML paper corpus.
     if "last_result" in st.session_state:
         result = st.session_state["last_result"]
 
-        st.markdown(
-            f"""<div class="query-box">
-<b>Current query:</b> {result.get("query", "")}<br>
-<span class="small">Collection: {result.get("dataset_name", st.session_state.get("last_dataset", ""))}</span>
-</div>""",
-            unsafe_allow_html=True,
-        )
+        st.markdown("#### Current query")
+        st.write(result.get("query", ""))
+        st.caption(f"Collection: {result.get('dataset_name', st.session_state.get('last_dataset', ''))}")
 
         show_result(result)
 
@@ -580,12 +645,15 @@ with tab_about:
 
     st.write(
         """
-This capstone investigates query-adaptive Retrieval-Augmented Generation
-through hybrid lexical and semantic retrieval.
+This capstone combines a controlled local AI/ML research corpus with
+external scholarly retrieval and optional grounded answer generation.
 
 The system classifies each query with a trained BERT classifier, maps the
 prediction to an adaptive α value, combines BM25 and BGE-M3 retrieval,
-and applies a trained cross-encoder to re-rank the candidate evidence.
+searches OpenAlex and arXiv when selected, then applies a trained
+cross-encoder to rerank and deduplicate the combined evidence. An optional,
+lazy-loaded local instruct model generates an answer from only the final
+reranked evidence; citation links are mapped from retrieved source records.
 """
     )
 
@@ -610,8 +678,7 @@ evaluation, and related topics.
     st.write(
         """
 The Research Demo accepts free-form questions. Benchmark evaluation
-numbers remain saved experimental results; a new query runs inference
-through the available trained retrieval components rather than pretending
-that a precomputed answer was generated for that question.
+numbers remain saved experimental results; new answers are generated only
+when requested and grounded in the current query's retrieved evidence.
 """
     )
