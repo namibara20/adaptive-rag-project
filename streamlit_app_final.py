@@ -369,13 +369,6 @@ with st.sidebar:
         value=5,
     )
 
-    if rag_backend is not None:
-        st.success("Research backend loaded")
-    else:
-        st.error("Research backend failed to load")
-        st.caption(str(BACKEND_ERROR))
-
-
 # ============================================================
 # HERO
 # ============================================================
@@ -434,7 +427,7 @@ and reranks evidence from the local corpus and selected external scholarly sourc
     st.markdown("### Search sources")
     source_cols = st.columns(3)
     with source_cols[0]:
-        use_local = st.checkbox("Local 89-paper corpus", value=True)
+        use_local = st.checkbox("Local corpus", value=True)
     with source_cols[1]:
         use_openalex = st.checkbox("OpenAlex", value=True)
     with source_cols[2]:
@@ -605,29 +598,17 @@ with tab_eval:
     ragas = evaluation.get(
         "ragas",
         {
-            "faithfulness": 0.0,
             "answer_relevancy": 0.7089,
-            "context_precision": 0.0,
         },
     )
 
-    cols = st.columns(3)
-    for col, (label, key) in zip(
-        cols,
-        [
-            ("Faithfulness", "faithfulness"),
-            ("Answer relevancy", "answer_relevancy"),
-            ("Context precision", "context_precision"),
-        ],
-    ):
-        with col:
-            st.markdown(
-                f"""<div class="metric-card">
-<div class="metric-value">{float(ragas.get(key, 0)):.4f}</div>
-<div class="metric-label">{label}</div>
+    st.markdown(
+        f"""<div class="metric-card">
+<div class="metric-value">{float(ragas.get('answer_relevancy', 0)):.4f}</div>
+<div class="metric-label">Answer relevancy</div>
 </div>""",
-                unsafe_allow_html=True,
-            )
+        unsafe_allow_html=True,
+    )
 
     st.caption(
         "The project records these as RAGAS-style values using custom "
@@ -667,18 +648,8 @@ reranked evidence; citation links are mapped from retrieved source records.
 
 **SQuAD** — extractive question answering benchmark.
 
-**AI/ML Research** — 89-paper local research corpus covering RAG,
+**AI/ML Research** — local research corpus covering RAG,
 LLMs, transformers, retrieval, fine-tuning, multimodal models,
 evaluation, and related topics.
-"""
-    )
-
-    st.markdown("### Demonstration behavior")
-
-    st.write(
-        """
-The Research Demo accepts free-form questions. Benchmark evaluation
-numbers remain saved experimental results; new answers are generated only
-when requested and grounded in the current query's retrieved evidence.
 """
     )
